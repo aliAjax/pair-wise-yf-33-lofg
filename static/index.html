@@ -1,3 +1,38 @@
 <!doctype html><html lang="zh-CN"><meta charset="utf-8"><title>卫星地面站排程台</title>
-<style>body{font:15px system-ui;max-width:1100px;margin:40px auto;background:#eef5f7;padding:0 20px;color:#102a43}section{background:white;padding:20px;border-radius:12px;margin:16px 0;box-shadow:0 2px 12px #0001}pre{background:#071827;color:#67e8f9;padding:16px;border-radius:8px;overflow:auto}input,button{font:inherit;padding:8px;margin:4px}button{background:#0369a1;color:white;border:0;border-radius:6px}</style>
-<h1>卫星地面站排程台</h1><p>查看请求、接收排程与站点状态。写入使用 JSON API，身份由 X-User-Id、X-Role 和租户头提供。</p><section><input id="u" value="operator"><input id="r" value="operator"><button onclick="load()">刷新</button><pre id="o"></pre></section><script>async function load(){let x=await fetch('/api/state',{headers:{'X-User-Id':u.value,'X-Role':r.value}});o.textContent=JSON.stringify(await x.json(),null,2)}load()</script>
+<style>
+body{font:15px system-ui;max-width:1100px;margin:40px auto;background:#eef5f7;padding:0 20px;color:#102a43}
+section{background:white;padding:20px;border-radius:12px;margin:16px 0;box-shadow:0 2px 12px #0001}
+table{border-collapse:collapse;width:100%;font-size:14px}
+th,td{padding:6px 8px;border-bottom:1px solid #e2e8f0;text-align:left;vertical-align:top}
+th{background:#f1f5f9}
+.bar{background:#e2e8f0;border-radius:4px;height:10px;min-width:140px}
+.bar>div{background:#0ea5e9;height:10px;border-radius:4px}
+.dropped{color:#b45309}.received{color:#15803d}.interrupted{color:#b45309}
+input,button{font:inherit;padding:8px;margin:4px}button{background:#0369a1;color:white;border:0;border-radius:6px}
+pre{background:#071827;color:#67e8f9;padding:16px;border-radius:8px;overflow:auto}
+</style>
+<h1>卫星地面站排程台</h1>
+<p>查看请求、接收排程、断点续传进度与站点状态。写入使用 JSON API，身份由 X-User-Id、X-Role 和租户头提供。</p>
+<section><input id="u" value="operator"><input id="r" value="operator"><input id="t" placeholder="租户(requester 必填)"><button onclick="load()">刷新</button></section>
+<section><h2>数据请求</h2><div id="requests"></div></section>
+<section><h2>接收排程与进度</h2><div id="schedules"></div></section>
+<section><h2>进度留档（掉线说明与续传结果）</h2><div id="progress"></div></section>
+<section><h2>原始状态</h2><pre id="o"></pre></section>
+<script>
+const EVENT={progress:'进度登记',dropout:'掉线',resume:'续传排程',completed:'完成接收'};
+const esc=s=>String(s??'').replace(/[&<>]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));
+const pct=s=>{if(s.data_mb==null)return'—';let p=Math.min(100,100*(s.received_mb||0)/s.data_mb);
+  return `<div class=bar><div style="width:${p}%"></div></div>${(s.received_mb||0).toFixed(0)} / ${s.data_mb} MB（${p.toFixed(0)}%）`};
+async function load(){
+  let h={'X-User-Id':u.value,'X-Role':r.value};if(t.value)h['X-Tenant']=t.value;
+  let x=await fetch('/api/state',{headers:h}),d=await x.json();
+  o.textContent=JSON.stringify(d,null,2);
+  requests.innerHTML='<table><tr><th>ID</th><th>卫星</th><th>租户</th><th>数据量(MB)</th><th>状态</th><th>截止</th></tr>'
+    +d.requests.map(q=>`<tr><td>${q.id}</td><td>${esc(q.satellite_id)}</td><td>${esc(q.tenant)}</td><td>${q.data_mb}</td><td class="${esc(q.status)}">${esc(q.status)}</td><td>${esc(q.deadline)}</td></tr>`).join('')+'</table>';
+  schedules.innerHTML='<table><tr><th>ID</th><th>请求</th><th>天线</th><th>时段</th><th>状态</th><th>接收进度</th><th>掉线/处置说明</th></tr>'
+    +d.schedules.map(s=>`<tr><td>${s.id}</td><td>${s.request_id??''}</td><td>${esc(s.antenna_id)}</td><td>${esc(s.starts_at)} → ${esc(s.ends_at)}</td><td class="${esc(s.status)}">${esc(s.status)}</td><td>${pct(s)}</td><td>${esc(s.disposition_reason)}</td></tr>`).join('')+'</table>';
+  progress.innerHTML='<table><tr><th>时间</th><th>请求</th><th>排程</th><th>事件</th><th>本次累计(MB)</th><th>请求累计(MB)</th><th>说明</th></tr>'
+    +(d.progress||[]).map(p=>`<tr><td>${esc(p.created_at)}</td><td>${p.request_id}</td><td>${p.schedule_id}</td><td>${EVENT[p.event]||esc(p.event)}</td><td>${p.session_received_mb}</td><td>${p.total_received_mb}</td><td>${esc(p.reason)}</td></tr>`).join('')+'</table>';
+}
+load()
+</script>

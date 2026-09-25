@@ -44,8 +44,27 @@ class Repository:
         CREATE TABLE IF NOT EXISTS visibility_windows(id INTEGER PRIMARY KEY AUTOINCREMENT, satellite_id TEXT NOT NULL REFERENCES satellites(id), station_id TEXT NOT NULL REFERENCES stations(id), starts_at TEXT NOT NULL, ends_at TEXT NOT NULL, max_rate_mbps REAL NOT NULL, revision INTEGER NOT NULL DEFAULT 1);
         CREATE TABLE IF NOT EXISTS requests(id INTEGER PRIMARY KEY AUTOINCREMENT, satellite_id TEXT NOT NULL REFERENCES satellites(id), tenant TEXT NOT NULL, priority INTEGER NOT NULL, data_mb REAL NOT NULL, deadline TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'pending', created_by TEXT NOT NULL, created_at TEXT NOT NULL);
         CREATE TABLE IF NOT EXISTS quotas(id INTEGER PRIMARY KEY AUTOINCREMENT, tenant TEXT NOT NULL, station_id TEXT NOT NULL REFERENCES stations(id), daily_seconds INTEGER NOT NULL, UNIQUE(tenant,station_id));
-        CREATE TABLE IF NOT EXISTS schedules(id INTEGER PRIMARY KEY AUTOINCREMENT, request_id INTEGER NOT NULL UNIQUE REFERENCES requests(id), window_id INTEGER NOT NULL REFERENCES visibility_windows(id), station_id TEXT NOT NULL REFERENCES stations(id), antenna_id TEXT NOT NULL REFERENCES antennas(id), satellite_id TEXT NOT NULL REFERENCES satellites(id), starts_at TEXT NOT NULL, ends_at TEXT NOT NULL, rate_mbps REAL NOT NULL, status TEXT NOT NULL DEFAULT 'scheduled', revision INTEGER NOT NULL DEFAULT 1, disposition_reason TEXT, created_by TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
+        CREATE TABLE IF NOT EXISTS schedules(id INTEGER PRIMARY KEY AUTOINCREMENT, request_id INTEGER NOT NULL REFERENCES requests(id), window_id INTEGER NOT NULL REFERENCES visibility_windows(id), station_id TEXT NOT NULL REFERENCES stations(id), antenna_id TEXT NOT NULL REFERENCES antennas(id), satellite_id TEXT NOT NULL REFERENCES satellites(id), starts_at TEXT NOT NULL, ends_at TEXT NOT NULL, rate_mbps REAL NOT NULL, status TEXT NOT NULL DEFAULT 'scheduled', received_mb REAL NOT NULL DEFAULT 0, revision INTEGER NOT NULL DEFAULT 1, disposition_reason TEXT, created_by TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
+        CREATE TABLE IF NOT EXISTS progress_log(id INTEGER PRIMARY KEY AUTOINCREMENT, request_id INTEGER NOT NULL REFERENCES requests(id), schedule_id INTEGER NOT NULL REFERENCES schedules(id), event TEXT NOT NULL, session_received_mb REAL NOT NULL, total_received_mb REAL NOT NULL, reason TEXT, actor TEXT NOT NULL, created_at TEXT NOT NULL);
         CREATE TABLE IF NOT EXISTS audit_log(id INTEGER PRIMARY KEY AUTOINCREMENT, request_id INTEGER, schedule_id INTEGER, actor TEXT NOT NULL, role TEXT NOT NULL, action TEXT NOT NULL, detail_json TEXT NOT NULL, created_at TEXT NOT NULL);
+        """)
+        self._migrate()
+
+    def _migrate(self) -> None:
+        cols = {row["name"] for row in self.conn.execute("PRAGMA table_info(schedules)")}
+        if "received_mb" not in cols:
+            self.conn.execute("ALTER TABLE schedules ADD COLUMN received_mb REAL NOT NULL DEFAULT 0")
+        legacy_unique = any(idx["unique"] and [c["name"] for c in self.conn.execute(f"PRAGMA index_info({idx['name']})")] == ["request_id"]
+                            for idx in self.conn.execute("PRAGMA index_list(schedules)"))
+        if not legacy_unique: return
+        self.conn.executescript("""
+        PRAGMA foreign_keys=OFF;
+        CREATE TABLE schedules_migrated(id INTEGER PRIMARY KEY AUTOINCREMENT, request_id INTEGER NOT NULL REFERENCES requests(id), window_id INTEGER NOT NULL REFERENCES visibility_windows(id), station_id TEXT NOT NULL REFERENCES stations(id), antenna_id TEXT NOT NULL REFERENCES antennas(id), satellite_id TEXT NOT NULL REFERENCES satellites(id), starts_at TEXT NOT NULL, ends_at TEXT NOT NULL, rate_mbps REAL NOT NULL, status TEXT NOT NULL DEFAULT 'scheduled', received_mb REAL NOT NULL DEFAULT 0, revision INTEGER NOT NULL DEFAULT 1, disposition_reason TEXT, created_by TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
+        INSERT INTO schedules_migrated(id,request_id,window_id,station_id,antenna_id,satellite_id,starts_at,ends_at,rate_mbps,status,received_mb,revision,disposition_reason,created_by,created_at,updated_at)
+            SELECT id,request_id,window_id,station_id,antenna_id,satellite_id,starts_at,ends_at,rate_mbps,status,received_mb,revision,disposition_reason,created_by,created_at,updated_at FROM schedules;
+        DROP TABLE schedules;
+        ALTER TABLE schedules_migrated RENAME TO schedules;
+        PRAGMA foreign_keys=ON;
         """)
 
     @contextmanager
@@ -153,6 +172,46 @@ class SatelliteSchedulingService:
         if exclude_schedule is not None: sql += " AND s.id!=?"; args.append(exclude_schedule)
         return int(conn.execute(sql, args).fetchone()[0])
 
+    def _request_received(self, conn: sqlite3.Connection, request_id: int) -> float:
+        return float(conn.execute("SELECT COALESCE(SUM(received_mb),0) FROM schedules WHERE request_id=?", (request_id,)).fetchone()[0])
+
+    def _log_progress(self, conn: sqlite3.Connection, request_id: int, schedule_id: int, event: str, session_mb: float, reason: str | None, actor: str) -> float:
+        total = self._request_received(conn, request_id)
+        conn.execute("INSERT INTO progress_log(request_id,schedule_id,event,session_received_mb,total_received_mb,reason,actor,created_at) VALUES(?,?,?,?,?,?,?,?)",
+                     (request_id, schedule_id, event, session_mb, total, reason, actor, iso()))
+        return total
+
+    def _insert_schedule(self, conn: sqlite3.Connection, request: sqlite3.Row, window_id: Any, antenna_id: str, start: datetime, end: datetime, rate: Any, required_mb: float, actor: str) -> tuple[int, float]:
+        window = conn.execute("SELECT * FROM visibility_windows WHERE id=?", (window_id,)).fetchone()
+        antenna = conn.execute("SELECT * FROM antennas WHERE id=?", (antenna_id,)).fetchone()
+        if not window or not antenna: raise ApiError(404, "schedule_ref_not_found", "请求、窗口或天线不存在")
+        if request["satellite_id"] != window["satellite_id"] or window["station_id"] != antenna["station_id"]: raise ApiError(409, "window_mismatch", "卫星、窗口和天线不匹配")
+        station = conn.execute("SELECT * FROM stations WHERE id=?", (window["station_id"],)).fetchone()
+        satellite = conn.execute("SELECT * FROM satellites WHERE id=?", (request["satellite_id"],)).fetchone()
+        if satellite["status"] != "active" or station["status"] != "active" or antenna["status"] != "active": raise ApiError(409, "resource_inactive", "卫星、地面站或天线不可用")
+        if station["weather"] != "clear": raise ApiError(409, "weather_blocked", "天气条件不允许接收")
+        w_start, w_end = parse_time(window["starts_at"]), parse_time(window["ends_at"])
+        if start < w_start or end > w_end: raise ApiError(409, "outside_visibility", "排程超出可见窗口")
+        if end > parse_time(request["deadline"]): raise ApiError(409, "deadline_missed", "预计结束时间超过请求截止时间")
+        max_rate = min(float(satellite["data_rate_mbps"]), float(window["max_rate_mbps"]), float(antenna["max_rate_mbps"]))
+        if float(rate) > max_rate: raise ApiError(409, "rate_exceeded", "请求速率超过可用上限", {"max_rate_mbps": max_rate})
+        transferred = (end - start).total_seconds() * float(rate) / 8
+        if transferred < required_mb: raise ApiError(409, "insufficient_capacity", "窗口内可接收数据量不足", {"capacity_mb": transferred, "required_mb": required_mb})
+        maintenance = conn.execute("""SELECT * FROM maintenance WHERE station_id=? AND (antenna_id IS NULL OR antenna_id=?) AND starts_at<? AND ends_at>?""", (station["id"], antenna_id, iso(end), iso(start))).fetchone()
+        if maintenance: raise ApiError(409, "maintenance_conflict", "天线或地面站处于维护期", dict(maintenance))
+        equipment = conn.execute("SELECT id,status FROM schedules WHERE station_id=? AND antenna_id=? AND starts_at<? AND ends_at>? AND status IN ('scheduled','receiving')", (station["id"], antenna_id, iso(end), iso(start))).fetchone()
+        if equipment: raise ApiError(409, "antenna_conflict", "天线时段已被占用", {"schedule_id": equipment["id"]})
+        satellite_conflict = conn.execute("SELECT id,status FROM schedules WHERE satellite_id=? AND starts_at<? AND ends_at>? AND status IN ('scheduled','receiving')", (request["satellite_id"], iso(end), iso(start))).fetchone()
+        if satellite_conflict: raise ApiError(409, "satellite_conflict", "同一卫星时段已被其他站接收", {"schedule_id": satellite_conflict["id"]})
+        quota = conn.execute("SELECT daily_seconds FROM quotas WHERE tenant=? AND station_id=?", (request["tenant"], station["id"])).fetchone()
+        used = self._used_quota(conn, request["tenant"], station["id"], start.date().isoformat())
+        duration = int((end - start).total_seconds())
+        if quota and used + duration > quota["daily_seconds"]: raise ApiError(409, "tenant_quota_exceeded", "租户当日地面站配额不足", {"used_seconds": used, "requested_seconds": duration, "limit": quota["daily_seconds"]})
+        cur = conn.execute("""INSERT INTO schedules(request_id,window_id,station_id,antenna_id,satellite_id,starts_at,ends_at,rate_mbps,created_by,created_at,updated_at)
+                              VALUES(?,?,?,?,?,?,?,?,?,?,?)""",
+                           (request["id"], window_id, station["id"], antenna_id, request["satellite_id"], iso(start), iso(end), float(rate), actor, iso(), iso()))
+        return cur.lastrowid, transferred
+
     def schedule_request(self, request_id: int, actor: str, role: str, body: dict[str, Any]) -> dict[str, Any]:
         if role not in {"operator", "commander"}: raise ApiError(403, "schedule_forbidden", "只有排程员可以安排接收")
         window_id, antenna_id = body.get("window_id"), str(body.get("antenna_id", "")).strip()
@@ -160,39 +219,30 @@ class SatelliteSchedulingService:
         if not isinstance(window_id, int) or not antenna_id or end <= start or not isinstance(rate, (int, float)) or float(rate) <= 0: raise ApiError(400, "invalid_schedule", "排程参数无效")
         with self.repo.tx() as conn:
             request = conn.execute("SELECT * FROM requests WHERE id=?", (request_id,)).fetchone()
-            window = conn.execute("SELECT * FROM visibility_windows WHERE id=?", (window_id,)).fetchone()
-            antenna = conn.execute("SELECT * FROM antennas WHERE id=?", (antenna_id,)).fetchone()
-            if not request or not window or not antenna: raise ApiError(404, "schedule_ref_not_found", "请求、窗口或天线不存在")
+            if not request: raise ApiError(404, "schedule_ref_not_found", "请求、窗口或天线不存在")
             if request["status"] not in {"pending", "preempted"}: raise ApiError(409, "request_closed", "请求当前不能排程")
-            if request["satellite_id"] != window["satellite_id"] or window["station_id"] != antenna["station_id"]: raise ApiError(409, "window_mismatch", "卫星、窗口和天线不匹配")
-            station = conn.execute("SELECT * FROM stations WHERE id=?", (window["station_id"],)).fetchone()
-            satellite = conn.execute("SELECT * FROM satellites WHERE id=?", (request["satellite_id"],)).fetchone()
-            if satellite["status"] != "active" or station["status"] != "active" or antenna["status"] != "active": raise ApiError(409, "resource_inactive", "卫星、地面站或天线不可用")
-            if station["weather"] != "clear": raise ApiError(409, "weather_blocked", "天气条件不允许接收")
-            w_start, w_end = parse_time(window["starts_at"]), parse_time(window["ends_at"])
-            if start < w_start or end > w_end: raise ApiError(409, "outside_visibility", "排程超出可见窗口")
-            if end > parse_time(request["deadline"]): raise ApiError(409, "deadline_missed", "预计结束时间超过请求截止时间")
-            max_rate = min(float(satellite["data_rate_mbps"]), float(window["max_rate_mbps"]), float(antenna["max_rate_mbps"]))
-            if float(rate) > max_rate: raise ApiError(409, "rate_exceeded", "请求速率超过可用上限", {"max_rate_mbps": max_rate})
-            transferred = (end - start).total_seconds() * float(rate) / 8
-            if transferred < float(request["data_mb"]): raise ApiError(409, "insufficient_capacity", "窗口内可接收数据量不足", {"capacity_mb": transferred, "required_mb": request["data_mb"]})
-            maintenance = conn.execute("""SELECT * FROM maintenance WHERE station_id=? AND (antenna_id IS NULL OR antenna_id=?) AND starts_at<? AND ends_at>?""", (station["id"], antenna_id, iso(end), iso(start))).fetchone()
-            if maintenance: raise ApiError(409, "maintenance_conflict", "天线或地面站处于维护期", dict(maintenance))
-            equipment = conn.execute("SELECT id,status FROM schedules WHERE station_id=? AND antenna_id=? AND starts_at<? AND ends_at>? AND status IN ('scheduled','receiving')", (station["id"], antenna_id, iso(end), iso(start))).fetchone()
-            if equipment: raise ApiError(409, "antenna_conflict", "天线时段已被占用", {"schedule_id": equipment["id"]})
-            satellite_conflict = conn.execute("SELECT id,status FROM schedules WHERE satellite_id=? AND starts_at<? AND ends_at>? AND status IN ('scheduled','receiving')", (request["satellite_id"], iso(end), iso(start))).fetchone()
-            if satellite_conflict: raise ApiError(409, "satellite_conflict", "同一卫星时段已被其他站接收", {"schedule_id": satellite_conflict["id"]})
-            quota = conn.execute("SELECT daily_seconds FROM quotas WHERE tenant=? AND station_id=?", (request["tenant"], station["id"])).fetchone()
-            used = self._used_quota(conn, request["tenant"], station["id"], start.date().isoformat())
-            duration = int((end - start).total_seconds())
-            if quota and used + duration > quota["daily_seconds"]: raise ApiError(409, "tenant_quota_exceeded", "租户当日地面站配额不足", {"used_seconds": used, "requested_seconds": duration, "limit": quota["daily_seconds"]})
-            cur = conn.execute("""INSERT INTO schedules(request_id,window_id,station_id,antenna_id,satellite_id,starts_at,ends_at,rate_mbps,created_by,created_at,updated_at)
-                                  VALUES(?,?,?,?,?,?,?,?,?,?,?)""",
-                               (request_id, window_id, station["id"], antenna_id, request["satellite_id"], iso(start), iso(end), float(rate), actor, iso(), iso()))
-            schedule_id = cur.lastrowid
+            schedule_id, transferred = self._insert_schedule(conn, request, window_id, antenna_id, start, end, rate, float(request["data_mb"]), actor)
             conn.execute("UPDATE requests SET status='scheduled' WHERE id=?", (request_id,))
             Repository.audit(conn, request_id, schedule_id, actor, role, "schedule_created", {"window_id": window_id, "antenna_id": antenna_id, "capacity_mb": transferred})
             return self.get_schedule(schedule_id)
+
+    def resume_request(self, request_id: int, actor: str, role: str, body: dict[str, Any]) -> dict[str, Any]:
+        if role not in {"operator", "commander"}: raise ApiError(403, "schedule_forbidden", "只有排程员可以安排续传")
+        window_id, antenna_id = body.get("window_id"), str(body.get("antenna_id", "")).strip()
+        start, end, rate = parse_time(body.get("starts_at")), parse_time(body.get("ends_at")), body.get("rate_mbps")
+        if not isinstance(window_id, int) or not antenna_id or end <= start or not isinstance(rate, (int, float)) or float(rate) <= 0: raise ApiError(400, "invalid_schedule", "排程参数无效")
+        with self.repo.tx() as conn:
+            request = conn.execute("SELECT * FROM requests WHERE id=?", (request_id,)).fetchone()
+            if not request: raise ApiError(404, "request_not_found", "请求不存在")
+            if request["status"] != "interrupted": raise ApiError(409, "resume_not_needed", "只有掉线中断的请求可以续传")
+            received_total = self._request_received(conn, request_id)
+            remaining = float(request["data_mb"]) - received_total
+            if remaining <= 0: raise ApiError(409, "nothing_to_resume", "目标数据量已收齐，无需续传")
+            schedule_id, transferred = self._insert_schedule(conn, request, window_id, antenna_id, start, end, rate, remaining, actor)
+            conn.execute("UPDATE requests SET status='scheduled' WHERE id=?", (request_id,))
+            self._log_progress(conn, request_id, schedule_id, "resume", 0.0, f"续传排程，剩余 {remaining:.1f} MB", actor)
+            Repository.audit(conn, request_id, schedule_id, actor, role, "resume_scheduled", {"window_id": window_id, "antenna_id": antenna_id, "remaining_mb": remaining, "capacity_mb": transferred})
+            return {"schedule": self.get_schedule(schedule_id), "previously_received_mb": received_total, "remaining_mb": remaining}
 
     def get_schedule(self, schedule_id: int) -> dict[str, Any]:
         row = self.repo.conn.execute("""SELECT s.*,r.tenant,r.data_mb,r.priority request_priority,r.deadline FROM schedules s JOIN requests r ON r.id=s.request_id WHERE s.id=?""", (schedule_id,)).fetchone()
@@ -201,7 +251,7 @@ class SatelliteSchedulingService:
 
     def transition(self, schedule_id: int, actor: str, role: str, tenant: str, target: str, body: dict[str, Any]) -> dict[str, Any]:
         with self.repo.tx() as conn:
-            row = conn.execute("""SELECT s.*,r.tenant,r.status request_status FROM schedules s JOIN requests r ON r.id=s.request_id WHERE s.id=?""", (schedule_id,)).fetchone()
+            row = conn.execute("""SELECT s.*,r.tenant,r.data_mb,r.status request_status FROM schedules s JOIN requests r ON r.id=s.request_id WHERE s.id=?""", (schedule_id,)).fetchone()
             if not row: raise ApiError(404, "schedule_not_found", "排程不存在")
             if target == "receiving":
                 if role not in {"operator", "commander"}: raise ApiError(403, "receive_forbidden", "当前角色不能开始接收")
@@ -210,11 +260,52 @@ class SatelliteSchedulingService:
             elif target == "received":
                 if role not in {"operator", "commander"}: raise ApiError(403, "receive_forbidden", "当前角色不能完成接收")
                 if row["status"] != "receiving": raise ApiError(409, "invalid_transition", "只有接收中任务可以完成")
+                total = self._request_received(conn, row["request_id"])
+                if total + 1e-6 < float(row["data_mb"]): raise ApiError(409, "incomplete_reception", "未达到目标数据量，不能完成接收", {"received_mb": total, "required_mb": float(row["data_mb"])})
                 conn.execute("UPDATE schedules SET status='received',revision=revision+1,updated_at=? WHERE id=?", (iso(), schedule_id))
                 conn.execute("UPDATE requests SET status='received' WHERE id=?", (row["request_id"],))
+                self._log_progress(conn, row["request_id"], schedule_id, "completed", float(row["received_mb"]), None, actor)
             else: raise ApiError(400, "invalid_transition", "未知状态")
             Repository.audit(conn, row["request_id"], schedule_id, actor, role, f"receive_{target}", {})
             return self.get_schedule(schedule_id)
+
+    def register_progress(self, schedule_id: int, actor: str, role: str, body: dict[str, Any]) -> dict[str, Any]:
+        if role not in {"operator", "commander"}: raise ApiError(403, "receive_forbidden", "当前角色不能登记接收进度")
+        received = body.get("received_mb")
+        if not isinstance(received, (int, float)) or float(received) <= 0: raise ApiError(400, "invalid_progress", "累计接收数据量必须为正数")
+        with self.repo.tx() as conn:
+            row = conn.execute("SELECT s.*,r.data_mb FROM schedules s JOIN requests r ON r.id=s.request_id WHERE s.id=?", (schedule_id,)).fetchone()
+            if not row: raise ApiError(404, "schedule_not_found", "排程不存在")
+            if row["status"] != "receiving": raise ApiError(409, "invalid_transition", "只有接收中任务可以登记进度")
+            if float(received) < float(row["received_mb"]) - 1e-6: raise ApiError(409, "progress_regression", "累计数据量不能低于已登记值", {"registered_mb": float(row["received_mb"])})
+            conn.execute("UPDATE schedules SET received_mb=?,revision=revision+1,updated_at=? WHERE id=?", (float(received), iso(), schedule_id))
+            total = self._log_progress(conn, row["request_id"], schedule_id, "progress", float(received), None, actor)
+            Repository.audit(conn, row["request_id"], schedule_id, actor, role, "receive_progress", {"received_mb": float(received), "total_received_mb": total})
+            return {"schedule": self.get_schedule(schedule_id), "request_received_mb": total, "remaining_mb": max(0.0, float(row["data_mb"]) - total)}
+
+    def drop_schedule(self, schedule_id: int, actor: str, role: str, body: dict[str, Any]) -> dict[str, Any]:
+        if role not in {"operator", "commander"}: raise ApiError(403, "receive_forbidden", "当前角色不能登记掉线")
+        reason = str(body.get("reason", "")).strip()
+        if not reason: raise ApiError(400, "reason_required", "掉线原因必填")
+        with self.repo.tx() as conn:
+            row = conn.execute("SELECT s.*,r.data_mb FROM schedules s JOIN requests r ON r.id=s.request_id WHERE s.id=?", (schedule_id,)).fetchone()
+            if not row: raise ApiError(404, "schedule_not_found", "排程不存在")
+            if row["status"] != "receiving": raise ApiError(409, "invalid_transition", "只有接收中任务可以登记掉线")
+            dropped_at = iso()
+            conn.execute("UPDATE schedules SET status='dropped',disposition_reason=?,revision=revision+1,updated_at=? WHERE id=?", (reason, dropped_at, schedule_id))
+            conn.execute("UPDATE requests SET status='interrupted' WHERE id=?", (row["request_id"],))
+            total = self._log_progress(conn, row["request_id"], schedule_id, "dropout", float(row["received_mb"]), reason, actor)
+            remaining = max(0.0, float(row["data_mb"]) - total)
+            Repository.audit(conn, row["request_id"], schedule_id, actor, role, "schedule_dropped", {"reason": reason, "received_mb": float(row["received_mb"]), "remaining_mb": remaining})
+            return {"schedule": self.get_schedule(schedule_id), "remaining_mb": remaining, "released_slot": {"starts_at": dropped_at, "ends_at": row["ends_at"]}}
+
+    def request_progress(self, request_id: int, role: str, tenant: str) -> dict[str, Any]:
+        request = self.repo.conn.execute("SELECT * FROM requests WHERE id=?", (request_id,)).fetchone()
+        if not request: raise ApiError(404, "request_not_found", "请求不存在")
+        if role == "requester" and request["tenant"] != tenant: raise ApiError(403, "tenant_forbidden", "不能查看其他租户进度")
+        entries = [dict(r) for r in self.repo.conn.execute("SELECT * FROM progress_log WHERE request_id=? ORDER BY id", (request_id,))]
+        received = self._request_received(self.repo.conn, request_id)
+        return {"request_id": request_id, "data_mb": float(request["data_mb"]), "received_mb": received, "remaining_mb": max(0.0, float(request["data_mb"]) - received), "entries": entries}
 
     def cancel_schedule(self, schedule_id: int, actor: str, role: str, tenant: str, body: dict[str, Any]) -> dict[str, Any]:
         reason = str(body.get("reason", "")).strip()
@@ -227,6 +318,7 @@ class SatelliteSchedulingService:
                 if row["status"] != "scheduled": raise ApiError(409, "cancel_not_allowed", "接收开始后租户不能取消")
             elif role not in {"operator", "commander"}: raise ApiError(403, "cancel_forbidden", "当前角色不能取消排程")
             if row["status"] == "received": raise ApiError(409, "received_data_protected", "已接收数据不能取消或删除")
+            if row["status"] == "dropped": raise ApiError(409, "dropout_archived", "掉线排程已留档，不能取消；请通过续传恢复请求")
             if row["status"] == "canceled": return self.get_schedule(schedule_id)
             conn.execute("UPDATE schedules SET status='canceled',disposition_reason=?,revision=revision+1,updated_at=? WHERE id=?", (reason, iso(), schedule_id))
             conn.execute("UPDATE requests SET status='pending' WHERE id=?", (row["request_id"],))
@@ -254,7 +346,7 @@ class SatelliteSchedulingService:
         with self.repo.tx() as conn:
             window = conn.execute("SELECT * FROM visibility_windows WHERE id=?", (window_id,)).fetchone()
             if not window: raise ApiError(404, "window_not_found", "可见窗口不存在")
-            rows = conn.execute("SELECT * FROM schedules WHERE window_id=? AND status IN ('scheduled','receiving','received')", (window_id,)).fetchall()
+            rows = conn.execute("SELECT s.*,r.data_mb FROM schedules s JOIN requests r ON r.id=s.request_id WHERE s.window_id=? AND s.status IN ('scheduled','receiving','received')", (window_id,)).fetchall()
             impacts = []
             for row in rows:
                 sched_start, sched_end = parse_time(row["starts_at"]), parse_time(row["ends_at"])
@@ -263,9 +355,15 @@ class SatelliteSchedulingService:
                     impacts.append({"schedule_id": row["id"], "action": "preserve_received_data", "reason": "已接收数据不可回滚", "invalid": invalid})
                     continue
                 if invalid:
-                    conn.execute("UPDATE schedules SET status='preempted',disposition_reason=?,revision=revision+1,updated_at=? WHERE id=?", ("visibility_window_changed", iso(), row["id"]))
-                    conn.execute("UPDATE requests SET status='preempted' WHERE id=?", (row["request_id"],))
-                    impacts.append({"schedule_id": row["id"], "request_id": row["request_id"], "action": "preempted", "reason": "新窗口无法覆盖原排程", "old_start": row["starts_at"], "old_end": row["ends_at"]})
+                    if row["status"] == "receiving":
+                        conn.execute("UPDATE schedules SET status='dropped',disposition_reason=?,revision=revision+1,updated_at=? WHERE id=?", ("visibility_window_changed", iso(), row["id"]))
+                        conn.execute("UPDATE requests SET status='interrupted' WHERE id=?", (row["request_id"],))
+                        total = self._log_progress(conn, row["request_id"], row["id"], "dropout", float(row["received_mb"]), "visibility_window_changed", actor)
+                        impacts.append({"schedule_id": row["id"], "request_id": row["request_id"], "action": "dropped_resumable", "reason": "窗口变更中断接收，进度已留档可续传", "received_mb": float(row["received_mb"]), "remaining_mb": max(0.0, float(row["data_mb"]) - total)})
+                    else:
+                        conn.execute("UPDATE schedules SET status='preempted',disposition_reason=?,revision=revision+1,updated_at=? WHERE id=?", ("visibility_window_changed", iso(), row["id"]))
+                        conn.execute("UPDATE requests SET status='preempted' WHERE id=?", (row["request_id"],))
+                        impacts.append({"schedule_id": row["id"], "request_id": row["request_id"], "action": "preempted", "reason": "新窗口无法覆盖原排程", "old_start": row["starts_at"], "old_end": row["ends_at"]})
                 else:
                     impacts.append({"schedule_id": row["id"], "action": "unchanged", "reason": "新窗口仍覆盖排程"})
             conn.execute("UPDATE visibility_windows SET starts_at=?,ends_at=?,revision=revision+1 WHERE id=?", (iso(start), iso(end), window_id))
@@ -285,15 +383,17 @@ class SatelliteSchedulingService:
         conn = self.repo.conn
         if role == "requester":
             requests = [dict(r) for r in conn.execute("SELECT * FROM requests WHERE tenant=? ORDER BY id DESC", (tenant,))]
-            schedules = [dict(r) for r in conn.execute("SELECT s.* FROM schedules s JOIN requests r ON r.id=s.request_id WHERE r.tenant=? ORDER BY s.id DESC", (tenant,))]
+            schedules = [dict(r) for r in conn.execute("SELECT s.*,r.data_mb FROM schedules s JOIN requests r ON r.id=s.request_id WHERE r.tenant=? ORDER BY s.id DESC", (tenant,))]
             stations = []
+            progress = [dict(r) for r in conn.execute("SELECT p.* FROM progress_log p JOIN requests r ON r.id=p.request_id WHERE r.tenant=? ORDER BY p.id DESC LIMIT 200", (tenant,))]
         elif role == "viewer":
-            requests, schedules, stations = [], [dict(r) for r in conn.execute("SELECT id,status,starts_at,ends_at FROM schedules ORDER BY id DESC")], []
+            requests, schedules, stations, progress = [], [dict(r) for r in conn.execute("SELECT id,status,starts_at,ends_at FROM schedules ORDER BY id DESC")], [], []
         else:
             requests = [dict(r) for r in conn.execute("SELECT * FROM requests ORDER BY id DESC")]
-            schedules = [dict(r) for r in conn.execute("SELECT * FROM schedules ORDER BY id DESC")]
+            schedules = [dict(r) for r in conn.execute("SELECT s.*,r.data_mb FROM schedules s JOIN requests r ON r.id=s.request_id ORDER BY s.id DESC")]
             stations = [dict(r) for r in conn.execute("SELECT * FROM stations ORDER BY id")]
-        return {"requests": requests, "schedules": schedules, "stations": stations, "server_time": iso()}
+            progress = [dict(r) for r in conn.execute("SELECT * FROM progress_log ORDER BY id DESC LIMIT 200")]
+        return {"requests": requests, "schedules": schedules, "stations": stations, "progress": progress, "server_time": iso()}
 
 
 def send_json(handler: BaseHTTPRequestHandler, status: int, payload: Any) -> None:
@@ -316,6 +416,7 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/state": return 200, self.service.state(role, tenant)
         parts = [p for p in path.split("/") if p]
         if len(parts) == 3 and parts[:2] == ["api", "schedules"] and parts[2].isdigit(): return 200, self.service.get_schedule(int(parts[2]))
+        if len(parts) == 4 and parts[:2] == ["api", "requests"] and parts[2].isdigit() and parts[3] == "progress": return 200, self.service.request_progress(int(parts[2]), role, tenant)
         raise ApiError(404, "not_found", "接口不存在")
     def post_api(self, path: str) -> tuple[int, Any]:
         actor, role, tenant = self.service.identity(self.headers); body = self.body(); parts = [p for p in path.split("/") if p]
@@ -333,9 +434,12 @@ class Handler(BaseHTTPRequestHandler):
             rid, action = int(parts[2]), parts[3]
             if action == "schedule": return 201, self.service.schedule_request(rid, actor, role, body)
             if action == "reschedule": return 200, self.service.reschedule(rid, actor, role, body)
+            if action == "resume": return 200, self.service.resume_request(rid, actor, role, body)
         if len(parts) == 4 and parts[:2] == ["api", "schedules"] and parts[2].isdigit():
             sid, action = int(parts[2]), parts[3]
             if action in {"start", "complete"}: return 200, self.service.transition(sid, actor, role, tenant, "receiving" if action == "start" else "received", body)
+            if action == "progress": return 200, self.service.register_progress(sid, actor, role, body)
+            if action == "drop": return 200, self.service.drop_schedule(sid, actor, role, body)
             if action == "cancel": return 200, self.service.cancel_schedule(sid, actor, role, tenant, body)
             if action == "preempt": return 200, self.service.emergency_preempt(sid, actor, role, body)
         if len(parts) == 4 and parts[:2] == ["api", "visibility-windows"] and parts[2].isdigit() and parts[3] == "change": return 200, self.service.change_window(int(parts[2]), actor, role, body)
