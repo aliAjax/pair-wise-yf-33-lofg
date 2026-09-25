@@ -1,3 +1,54 @@
 <!doctype html><html lang="zh-CN"><meta charset="utf-8"><title>卫星地面站排程台</title>
-<style>body{font:15px system-ui;max-width:1100px;margin:40px auto;background:#eef5f7;padding:0 20px;color:#102a43}section{background:white;padding:20px;border-radius:12px;margin:16px 0;box-shadow:0 2px 12px #0001}pre{background:#071827;color:#67e8f9;padding:16px;border-radius:8px;overflow:auto}input,button{font:inherit;padding:8px;margin:4px}button{background:#0369a1;color:white;border:0;border-radius:6px}</style>
-<h1>卫星地面站排程台</h1><p>查看请求、接收排程与站点状态。写入使用 JSON API，身份由 X-User-Id、X-Role 和租户头提供。</p><section><input id="u" value="operator"><input id="r" value="operator"><button onclick="load()">刷新</button><pre id="o"></pre></section><script>async function load(){let x=await fetch('/api/state',{headers:{'X-User-Id':u.value,'X-Role':r.value}});o.textContent=JSON.stringify(await x.json(),null,2)}load()</script>
+<style>
+body{font:15px system-ui;max-width:1200px;margin:40px auto;background:#eef5f7;padding:0 20px;color:#102a43}
+section{background:white;padding:20px;border-radius:12px;margin:16px 0;box-shadow:0 2px 12px #0001}
+input,button{font:inherit;padding:8px;margin:4px}
+button{background:#0369a1;color:white;border:0;border-radius:6px;cursor:pointer}
+table{border-collapse:collapse;width:100%;font-size:13px}
+th,td{border-bottom:1px solid #d9e2ec;padding:6px 8px;text-align:left;vertical-align:top}
+th{background:#f0f4f8}
+.tag{display:inline-block;padding:2px 8px;border-radius:10px;font-size:12px;color:#fff;background:#627d98}
+.tag-receiving{background:#0369a1}.tag-offline{background:#b45309}.tag-received{background:#15803d}
+.tag-scheduled{background:#475569}.tag-canceled,.tag-preempted{background:#9f1239}
+.bar{background:#d9e2ec;border-radius:6px;height:10px;width:140px;overflow:hidden}
+.bar>i{display:block;height:100%;background:#0ea5e9}
+.muted{color:#627d98;font-size:12px}
+</style>
+<h1>卫星地面站排程台</h1>
+<p>查看请求、接收排程、断点续传进度与站点状态。写入使用 JSON API，身份由 X-User-Id、X-Role 和租户头提供。</p>
+<section>
+  <input id="u" value="operator"><input id="r" value="operator"><input id="t" placeholder="X-Tenant（requester 必填）">
+  <button onclick="load()">刷新</button>
+  <span class="muted">角色：viewer / requester / operator / commander / auditor</span>
+</section>
+<section><h2>接收排程（含累计进度）</h2>
+  <table id="sched"><thead><tr>
+    <th>#</th><th>请求</th><th>站/天线</th><th>计划时段</th><th>实际结束</th><th>状态</th>
+    <th>本段已收(MB)</th><th>累计/目标(MB)</th><th>进度</th><th>掉线说明 / 续传结果</th>
+  </tr></thead><tbody></tbody></table>
+</section>
+<section><h2>接收进度留档（receive_progress，仅追加）</h2>
+  <table id="prog"><thead><tr><th>#</th><th>时间</th><th>请求</th><th>排程段</th><th>类型</th><th>本段(MB)</th><th>累计(MB)</th><th>明细</th></tr></thead><tbody></tbody></table>
+</section>
+<section><h2>数据请求</h2><table id="req"><thead><tr><th>#</th><th>卫星</th><th>租户</th><th>数据量(MB)</th><th>截止</th><th>状态</th></tr></thead><tbody></tbody></table></section>
+<script>
+function esc(s){return String(s??'').replace(/[&<>]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]))}
+function tag(s){return `<span class="tag tag-${esc(s)}">${esc(s)}</span>`}
+function bar(cur,total){let pct=total>0?Math.min(100,cur/total*100):0;return `<div class="bar"><i style="width:${pct}%"></i></div><span class="muted">${pct.toFixed(1)}%</span>`}
+function rows(t,cols){t.querySelector('tbody').innerHTML=cols.map(r=>`<tr>${r.map(c=>`<td>${c}</td>`).join('')}</tr>`).join('')}
+async function load(){
+  let h={'X-User-Id':u.value,'X-Role':r.value}; if(t.value) h['X-Tenant']=t.value;
+  let x=await fetch('/api/state',{headers:h}); let d=await x.json();
+  if(d.error){document.querySelectorAll('tbody').forEach(b=>b.innerHTML='');alert(d.error+': '+d.message);return}
+  rows(document.getElementById('sched'),(d.schedules||[]).map(s=>{
+    let target=s.data_mb??0, cum=s.cumulative_mb??0, note='';
+    if(s.status==='offline'){let rw=s.released_window?`，释放剩余时段 ${s.released_window.seconds}s（${s.released_window.after} 起）`:'';note=`掉线：${esc(s.disposition_reason||'')}${rw}`}
+    if(s.resume_of_schedule_id) note=`续传自排程 #${s.resume_of_schedule_id}；接着累计已收 ${cum.toFixed?cum.toFixed(1):cum} MB`
+    if(s.resume_result) note=`续传成功：自 ${s.resume_result.continued_from_mb} MB 继续，剩余 ${s.resume_result.remaining_mb.toFixed(1)} MB，本段容量 ${s.resume_result.segment_capacity_mb.toFixed(1)} MB`
+    return [s.id,s.request_id,`${esc(s.station_id)}/${esc(s.antenna_id)}`,`${esc(s.starts_at)}<br>~ ${esc(s.ends_at)}`,esc(s.actual_ends_at||'—'),tag(s.status),(s.received_mb??0).toFixed(1),`${cum.toFixed(1)} / ${target}`,bar(cum,target),note]
+  }));
+  rows(document.getElementById('prog'),(d.receive_progress||[]).map(p=>[p.id,esc(p.created_at),p.request_id,p.schedule_id,tag(p.kind),Number(p.received_mb).toFixed(1),Number(p.cumulative_mb).toFixed(1),`<code>${esc(p.detail_json)}</code>`]));
+  rows(document.getElementById('req'),(d.requests||[]).map(q=>[q.id,esc(q.satellite_id),esc(q.tenant),q.data_mb,esc(q.deadline),tag(q.status)]));
+}
+load();
+</script>
